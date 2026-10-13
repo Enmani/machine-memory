@@ -23,10 +23,21 @@ cd machine-memory
 python install.py --instructions
 ```
 
-This installs `memo` and `memolib` under `~/.optmem` and adds a managed instruction
-block to existing Codex, Claude Code and oh-my-pi instruction files. It preserves
-the surrounding instructions. Plain `python install.py` installs the tools and
-writes a block you can add yourself. Neither command creates a startup item.
+This installs `memo`, `memolib`, and the `machine-memory` skill. A short managed
+block in existing Codex, Claude Code and oh-my-pi instruction files keeps the
+startup requirement and routes relevant tasks to the skill. It preserves the
+surrounding instructions. Plain `python install.py` installs the tools and skill
+and writes a block you can add yourself. Neither command creates a startup item.
+
+The skill is published to existing agents' skill directories; shared directories
+are resolved once. The copy under `~/.optmem/skills/machine-memory` is also linked
+directly from the managed block. Local command paths are generated at install
+time, keeping machine-specific paths out of the repository.
+
+The skill searches when missing prior decisions, progress or preferences could
+change the current task. It skips repeated retrieval when the conversation
+already supplies enough context, and loads command and tree references only as
+needed. Automatic selection is instruction-guided; no per-message hook is added.
 
 On Windows, run the installed tool as `python "$HOME/.optmem/memo"`.
 The commands printed by the tool use the correct absolute path.
