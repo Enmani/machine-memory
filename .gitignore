@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+*.log
+*.jsonl
+.venv/
+memory/
+work/
+outputs/
+integration/AGENTS-block.md
+harvest/staging/
+harvest/imported/
+harvest/backups/
+.DS_Store

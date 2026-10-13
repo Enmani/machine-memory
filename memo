@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""memo: one permanent, append-only memory for every agent on this machine.
+
+  {memo} init             create this memory; print the setup block.
+  {memo} wake [part [T]]  read your memory. Run first, every session.
+  {memo} note "..."       record one memory: one short line.
+  {memo} nap [id "..."]   do the pending compressions.
+  {memo} recall <regex>   search every memory ever recorded.
+  {memo} zoom <lo>-<hi>   open a tree node: its two halves.
+  {memo} forget <lo>-<hi> drop a bad summary; nap rebuilds it.
+  {memo} config [NAME=N]  show this memory's sizes, or change one.
+  {memo} import <file>    bulk-load dated memories (bootstrap only).
+  {memo} search "..."     search by meaning, using the existing omp CLI on demand.
+  {memo} inspect <id>     show every source and decision relationship.
+  {memo} relate <new> <old> replaces|duplicate|enriches|challenges --reason "..."
+  {memo} review [--apply] review pending relationships; preview by default.
+  {memo} knowledge-status show duplicate observations and relationships.
+
+The store follows OptMem (github.com/VictorTaelin/OptMem): LOG.txt holds one
+fixed-width record per memory, TREE/<size> one fixed-width summary per aligned
+power-of-two block. Same files, same commands; this code was written
+independently, so a store written by either tool can be read by the other.
+The memories live in ~/.optmem/memory, or in $MEMORY_DIR if set.
+"""
+
+import datetime
+import os
+import re
+import sys
+from collections import deque
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from memolib import store as S  # noqa: E402  (the log, the tree, the locks, the sizes)
+from memolib.store import (  # noqa: E402
+    KNOBS,
+    apply_config,
+    block_id,
+    check_knob,
+    check_line,
+    cover,
+    die,
+    log_append,
+    log_get,
+    log_len,
+    log_path,
+    log_scan,
+    memory_dir,
+    next_nap,
+    overrides,
+    pending,
+    pending_count,
+    plural,
+    pretty,
+    store,
+    tree_drop,
+    tree_get,
+    tree_put,
+    write_config)
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):  # the store is UTF-8, whatever the locale says
+        _stream.reconfigure(encoding="utf-8")
+
+# Every command this tool prints must run as printed. On Windows a script has no shebang to rely on, and `~` is
+# not expanded the same way by every shell, so the command names the interpreter and spells the path out.
+ME = S.ME = ("python " if os.name == "nt" else "") + pretty(__file__)
+
+# ------------------------------------------------------------------ commands
+
+BLOCK = """\
+## Memory
+
+Your memory is this machine's memory, kept with `memo` (the OptMem design):
+- The tool is `{memo}`
+- Your memories are in `{data}`
+
+It outlives every session, compaction, model and vendor change, and every agent on this
+machine reads and writes the same one. Without it you do not know who you are, or what
+was decided and tried.
+
+### At startup: activating memory (mandatory)
+
+Run `{memo} wake` before any other tool call, in every session, and then do exactly what
+it prints, to the end of its output.
+
+### While working: register memories (mandatory)
+
+Call `{memo} note "<1 line, max {chars} bytes>"` whenever you learn something new, or
+something worth keeping happens: a task worth real effort (name the project), a decision
+and why, a fact or insight the user teaches you, anything you learn about their life,
+any event of lasting effect. Do not register redundant memories.
+
+If `{memo} note` asks a compression: do it before your next action.
+
+Never edit or delete anything under `{data}`: the tool manages it.
+
+### When you need an old memory: search, or navigate
+
+`{memo} recall <regex>` searches every memory, word for word.
+
+Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line summaries, pairs of
+those as #0-3, and so on -- every `#a-b` line wake prints is one node of it.
+`{memo} zoom <a-b>` opens a node into its two halves, down to the raw memories.
+
+### If you're a subagent: skip everything above
+
+Parallel sessions on this machine are all you, and may all write memories. A subagent is
+not: it must never run `memo`, because it cannot judge what is already known, and its
+notes would arrive duplicated and incorrectly. When you spawn one, write:
+`You are a subagent. Don't run memo.`
+"""
+
+def cmd_init(args):
+    """The only command that may create the memory. Safe to repeat: it creates what is missing."""
+    if args:
+        die("usage: %s init" % ME)
+    d = memory_dir()
+    fresh = not os.path.isdir(d)
+    os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
+    open(log_path(d), "a").close()
+    if not os.path.exists(os.path.join(d, "config")):
+        write_config(d, {})
+    apply_config(d)
+    print(("Created %s: this machine's memory, one identity, forever." % pretty(d)) if fresh
+          else "Found %s: %s." % (pretty(d), plural(log_len(d), "memory")))
+    print("Sizes live in %s/config; the defaults are fine.\n" % pretty(d))
+    print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:\n")
+    print(BLOCK.format(memo=ME, data=pretty(d), chars=S.ENTRY_CHARS).rstrip())
+
+def paginate(lines):
+    """Split a document into parts that survive any harness's output cap."""
+    parts, current, size = [], [], 0
+    for line in lines:
+        n = len(line.encode("utf-8")) + 1
+        if current and (len(current) >= S.PART_LINES or size + n > S.PART_CHARS):
+            parts.append(current)
+            current, size = [], 0
+        current.append(line)
+        size += n
+    if current:
+        parts.append(current)
+    return parts
+
+def wake_lines(d, T):
+    """The memory context as of T, or the first compression it is missing (lo, hi)."""
+    lines = []
+    for lo, hi in cover(T, S.WAKE_LINES):
+        if hi - lo == 1:
+            lines.append("#%d %s %s" % log_get(d, lo))
+            continue
+        summary = tree_get(d, lo, hi)
+        if summary is None:
+            return None, (lo, hi)
+        lines.append("#%d-%d %s" % (lo, hi - 1, summary))
+    return lines, None
+
+def cmd_wake(args):
+    d = store()
+    now, part, T = log_len(d), 1, log_len(d)
+    if args:
+        if len(args) > 2 or not all(a.isdigit() for a in args):
+            die("usage: %s wake [part [T]]" % ME)
+        part = int(args[0])
+        if len(args) == 2:
+            T = int(args[1])
+            if T > now:
+                die("T=%d, but the log holds %s. Run: %s wake" % (T, plural(now, "memory"), ME))
+    if not T:
+        print("No memories yet. Record the first with: %s note \"<one line>\"\nYou are awake." % ME)
+        return
+    lines, missing = wake_lines(d, T)
+    if lines is None:
+        # The only reason to refuse: this document cannot be written without that summary.
+        print("Cannot wake: the memory context needs #%d-%d, which is not compressed yet.\n"
+              "Do the %s below, then run %s wake again.\n"
+              % (missing[0], missing[1] - 1, plural(pending_count(d, T), "compression"), ME))
+        print(next_nap(d, T))
+        sys.exit(1)
+    parts = paginate(lines)
+    if not 1 <= part <= len(parts):
+        die("No part %d: the memory has %s. Run: %s wake" % (part, plural(len(parts), "part"), ME))
+    if len(parts) > 1:
+        print("Your memory, part %d of %d, oldest first (%s)." % (part, len(parts), plural(T, "memory")))
+    print("\n".join(parts[part - 1]))
+    if part < len(parts):
+        print("Not awake yet. Run: %s wake %d %d" % (ME, part + 1, T))
+    else:
+        print("You are awake.")
+        follow = next_nap(d, T)
+        if follow:
+            print("\n" + follow)
+
+def cmd_note(args):
+    if len(args) != 1:
+        die("usage: %s note \"<one line, at most %d bytes>\"" % (ME, S.ENTRY_CHARS))
+    d = store()
+    apply_config(d)
+    from memolib.knowledge import Catalog
+    with Catalog(d) as catalog:
+        i, appended = catalog.append([(datetime.date.today().isoformat(), check_line(args[0]))])[0]
+    print("Saved as #%d." % i if appended else "Same content as #%d; source observation retained." % i)
+    follow = next_nap(d, log_len(d))
+    if follow:
+        print("\n" + follow)
+
+def cmd_nap(args):
+    d = store()
+    T, said = log_len(d), bool(args)
+    if args:
+        if len(args) != 2:
+            die("usage: %s nap <lo>-<hi> \"<one line>\"" % ME)
+        lo, hi = block_id(args[0])
+        todo = pending(d, T, limit=1)
+        if not todo:
+            print("Nothing left to compress.")
+            return
+        if (lo, hi) != todo[0]:
+            if tree_get(d, lo, hi) is not None:
+                print("%d-%d is already settled." % (lo, hi - 1))
+            else:
+                die("Wrong block: %s. Blocks are built in order; the next is %d-%d. Run: %s nap"
+                    % (args[0], todo[0][0], todo[0][1] - 1, ME))
+        elif not tree_put(d, lo, hi, check_line(args[1])):
+            print("%d-%d was settled or forgotten meanwhile." % (lo, hi - 1))
+        else:
+            print("%d-%d saved." % (lo, hi - 1))
+    follow = next_nap(d, T)
+    print(("\n" if said else "") + follow if follow else "Nothing left to compress.")
+
+def cmd_recall(args):
+    if len(args) != 1:
+        die("usage: %s recall <regex>" % ME)
+    d = store()
+    try:
+        pattern = re.compile(args[0], re.I)
+    except re.error as error:
+        die("bad regex: %s" % error)
+    # Keep only the newest matches that fit one output part: a vague regex matches everything.
+    hits, kept, size = 0, deque(), 0
+    for entry in log_scan(d):
+        line = "#%d %s %s" % entry
+        if pattern.search(line):
+            hits += 1
+            kept.append(line)
+            size += len(line.encode("utf-8")) + 1
+            while size > S.PART_CHARS:
+                size -= len(kept.popleft().encode("utf-8")) + 1
+    if not hits:
+        print("No match.")
+        return
+    print("\n".join(kept))
+    print("Newest %d of %s. Narrow the regex." % (len(kept), plural(hits, "match")) if len(kept) < hits else "%s." % plural(hits, "match"))
+
+def cmd_zoom(args):
+    if len(args) != 1:
+        die("usage: %s zoom <lo>-<hi>   # a block id, as wake prints them" % ME)
+    d = store()
+    lo, hi = block_id(args[0])
+    T = log_len(d)
+    if lo >= T:
+        die("#%s is beyond the memory: it holds %s. Run: %s wake" % (args[0], plural(T, "memory"), ME))
+    mid = (lo + hi) // 2
+    for a, b in ((lo, mid), (mid, hi)):
+        if a >= T:
+            continue  # the future: nothing there yet
+        if b - a == 1:
+            print("#%d %s %s" % log_get(d, a))
+        else:
+            print("#%d-%d %s" % (a, b - 1, tree_get(d, a, b) or "not compressed yet"))
+
+def cmd_forget(args):
+    if len(args) != 1:
+        die("usage: %s forget <lo>-<hi>" % ME)
+    d = store()
+    gone = tree_drop(d, *block_id(args[0]))
+    if not gone:
+        die("No summary at %s." % args[0])
+    print("Forgot %s, from %d-%d up. Run: %s nap" % (plural(len(gone), "summary"), gone[0][0], gone[0][1] - 1, ME))
+
+def cmd_config(args):
+    d = store()
+    over = overrides(d)
+    for arg in args:
+        name, equals, value = arg.partition("=")
+        name = name.strip().upper()
+        if not equals or name not in KNOBS:
+            die("usage: %s config [NAME=VALUE ...]   # NAME one of %s" % (ME, ", ".join(KNOBS)))
+        if value.strip():
+            over[name] = check_knob(name, value.strip())
+        else:
+            over.pop(name, None)
+    if args:
+        write_config(d, over)
+    for name, (default, meaning) in KNOBS.items():
+        print("%-12s %-7d %s%s" % (name, over.get(name, default), meaning, "" if name not in over else " (default %d)" % default))
+
+def parse_import_lines(lines, floor, limit):
+    """Validate 'YYYY-MM-DD <text>' lines. Dates may not go backwards, from `floor` on."""
+    out, last = [], floor
+    for number, line in enumerate(lines, 1):
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        date, _, text = line.partition(" ")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            die("line %d: expected 'YYYY-MM-DD <text>', got: %s" % (number, line))
+        try:
+            datetime.datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            die("line %d: %s is not a real date." % (number, date))
+        if date < last:
+            die("line %d: date %s precedes the previous memory (%s)." % (number, date, last))
+        text = text.strip()
+        if not text or len(text.encode("utf-8")) > limit:
+            die("line %d: %d bytes, limit %d." % (number, len(text.encode("utf-8")), limit))
+        out.append((date, text))
+        last = date
+    return out
+
+def cmd_import(args):
+    if len(args) != 1:
+        die("usage: %s import <file>   # lines of 'YYYY-MM-DD <text>'" % ME)
+    d = store()
+    apply_config(d)
+    try:
+        lines = open(args[0], encoding="utf-8").readlines()
+    except UnicodeDecodeError:
+        die("%s is not UTF-8 text. Convert it, then import again." % pretty(args[0]))
+    out = parse_import_lines(lines, log_get(d, log_len(d) - 1)[1] if log_len(d) else "0000-00-00", S.ENTRY_CHARS)
+    if not out:
+        die("%s has no memories." % args[0])
+    base = log_append(d, out)
+    print("Imported %s, #%d to #%d." % (plural(len(out), "memory"), base, base + len(out) - 1))
+    left = pending_count(d, log_len(d))
+    if left:
+        print("%s pending. Run: %s nap" % (plural(left, "compression"), ME))
+
+COMMANDS = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
+            "zoom": cmd_zoom, "forget": cmd_forget, "config": cmd_config, "import": cmd_import}
+
+def main():
+    import sqlite3
+    from memolib.commands import NAMES, run
+    usage = __doc__.strip().format(memo=ME)
+    if len(sys.argv) < 2:
+        print(usage)
+        return
+    command = sys.argv[1]
+    if command != "init" and command not in COMMANDS and command not in NAMES:
+        print("No such command: %s\n" % command, file=sys.stderr)
+        print(usage, file=sys.stderr)
+        sys.exit(1)
+    try:
+        if command == "init":
+            cmd_init(sys.argv[2:])
+        elif command in NAMES:
+            run(command, sys.argv[2:])
+        else:
+            apply_config(store())
+            COMMANDS[command](sys.argv[2:])
+    except OSError as error:
+        die("%s: %s." % (pretty(error.filename or memory_dir()), error.strerror or error))
+    except (ValueError, sqlite3.Error) as error:
+        die("%s: %s" % (command, error))
+    except Exception as error:
+        from memolib.engine import EngineError
+        if isinstance(error, EngineError):
+            die("Model processing failed: %s. Keyword recall still works." % error)
+        raise
+
+if __name__ == "__main__":
+    main()
